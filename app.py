@@ -18,10 +18,10 @@ app = Flask(__name__)
 CORS(app)
 
 # Backblaze B2 configuration
-B2_KEY_ID = os.getenv('B2_KEY_ID')
-B2_APP_KEY = os.getenv('B2_APP_KEY')
-B2_ENDPOINT = os.getenv('B2_ENDPOINT')
-B2_BUCKET = os.getenv('B2_BUCKET')
+B2_KEY_ID = os.getenv('B2_KEY_ID', '0037b711c53ab060000000002')
+B2_APP_KEY = os.getenv('B2_APP_KEY', 'K003gC6T0K2CkzcZu3TutLXyzbn6rvU')
+B2_ENDPOINT = os.getenv('B2_ENDPOINT', 's3.eu-central-003.backblazeb2.com')
+B2_BUCKET = os.getenv('B2_BUCKET', 'saracens-worlds')
 
 # Initialize B2 client
 s3_client = boto3.client(
