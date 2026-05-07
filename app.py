@@ -5,14 +5,23 @@ import zipfile
 import shutil
 from io import BytesIO
 from datetime import datetime, timedelta
-
 import numpy as np
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import boto3
 from PIL import Image
-import anvil.parser as anvil
-from anvil.region import RegionFile
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+try:
+    import anvil.parser as anvil
+    from anvil.region import RegionFile
+except ImportError as e:
+    logger.error(f"Failed to import anvil-parser: {e}")
+    raise ImportError("anvil-parser is required but not installed. Install with: pip install anvil-parser")
 
 app = Flask(__name__)
 CORS(app)
@@ -60,20 +69,29 @@ def world_to_iso(x, y, z, tile_w=2, tile_h=1):
 
 def generate_presigned_url(key, expiration=86400):
     """Generate a presigned URL for B2 download"""
-    return s3_client.generate_presigned_url(
-        'get_object',
-        Params={'Bucket': B2_BUCKET, 'Key': key},
-        ExpiresIn=expiration
-    )
+    try:
+        return s3_client.generate_presigned_url(
+            'get_object',
+            Params={'Bucket': B2_BUCKET, 'Key': key},
+            ExpiresIn=expiration
+        )
+    except Exception as e:
+        logger.error(f"Error generating presigned URL: {e}")
+        return None
 
 def upload_to_b2(file_data, key):
     """Upload file to Backblaze B2"""
-    s3_client.put_object(
-        Bucket=B2_BUCKET,
-        Key=key,
-        Body=file_data,
-        ContentType='application/zip' if key.endswith('.zip') else 'image/png'
-    )
+    try:
+        s3_client.put_object(
+            Bucket=B2_BUCKET,
+            Key=key,
+            Body=file_data,
+            ContentType='application/zip' if key.endswith('.zip') else 'image/png'
+        )
+        logger.info(f"Successfully uploaded {key} to B2")
+    except Exception as e:
+        logger.error(f"Error uploading to B2: {e}")
+        raise e
 
 @app.route('/generate-world', methods=['POST'])
 def generate_world():
@@ -90,7 +108,7 @@ def generate_world():
         
         # Create region directory
         region_dir = os.path.join(world_dir, 'region')
-        os.makedirs(region_dir)
+        os.makedirs(region_dir, exist_ok=True)
         
         # World dimensions and center
         world_size = 1040
@@ -99,10 +117,16 @@ def generate_world():
         
         # Create region files (32x32 chunks each)
         region_files = {}
-        for region_x in range(0, 1040, 512):
-            for region_z in range(0, 1040, 512):
-                region_key = f"r.{region_x//512}.{region_z//512}.mca"
-                region_files[region_key] = RegionFile()
+        logger.info(f"Creating region files for world generation...")
+        
+        try:
+            for region_x in range(0, 1040, 512):
+                for region_z in range(0, 1040, 512):
+                    region_key = f"r.{region_x//512}.{region_z//512}.mca"
+                    region_files[region_key] = RegionFile()
+        except Exception as e:
+            logger.error(f"Error creating region files: {e}")
+            return jsonify({"success": False, "error": f"Region file creation failed: {str(e)}"}), 500
         
         # Generate world blocks
         for x in range(world_size):
@@ -159,9 +183,9 @@ def generate_world():
                             ground_level = 60 + int(elevation * 40)
                             if y == ground_level:
                                 block_id = 2  # grass
-                            elif y > 0 and y < ground_level:
+                            elif y > 0 and y < ground_level + 3:
                                 block_id = 3  # dirt
-                            elif y > ground_level and y <= ground_level + 3:
+                            elif y >= ground_level and y <= ground_level + 3:
                                 block_id = 1  # stone
                             else:
                                 continue
@@ -171,9 +195,9 @@ def generate_world():
                             if y == ground_level:
                                 block_id = 2  # grass
                             elif y > 0 and y < ground_level - 1:
-                                block_id = 1  # stone
-                            elif y == ground_level - 1:
                                 block_id = 3  # dirt
+                            elif y >= ground_level - 1 and y <= ground_level + 2:
+                                block_id = 1  # stone
                             else:
                                 continue
                         else:
@@ -193,14 +217,24 @@ def generate_world():
                         continue
                     
                     # Set block in region
-                    chunk = region.get_chunk(chunk_x, chunk_z)
-                    chunk.set_block(x % 16, y, z % 16, block_id)
+                    try:
+                        chunk = region.get_chunk(chunk_x, chunk_z)
+                        chunk.set_block(x % 16, y, z % 16, block_id)
+                    except Exception as e:
+                        logger.warning(f"Failed to set block at ({x}, {y}, {z}): {e}")
+                        continue
         
         # Save region files
-        for region_key, region in region_files.items():
-            region_path = os.path.join(region_dir, region_key)
-            with open(region_path, 'wb') as f:
-                region.write(f)
+        logger.info(f"Saving {len(region_files)} region files...")
+        try:
+            for region_key, region in region_files.items():
+                region_path = os.path.join(region_dir, region_key)
+                with open(region_path, 'wb') as f:
+                    region.write(f)
+            logger.info(f"Region files saved successfully")
+        except Exception as e:
+            logger.error(f"Error saving region files: {e}")
+            return jsonify({"success": False, "error": f"Region file save failed: {str(e)}"}), 500
         
         # Create level.dat (basic world data)
         level_data = {
@@ -216,49 +250,63 @@ def generate_world():
         }
         
         # Save level.dat
-        import anvil.nbt as nbt
-        root_tag = nbt.Compound('Data')
-        for key, value in level_data['Data'].items():
-            if isinstance(value, str):
-                root_tag[key] = nbt.String(key, value)
-            elif isinstance(value, int):
-                root_tag[key] = nbt.Int(key, value)
-            elif isinstance(value, bool):
-                root_tag[key] = nbt.Byte(key, 1 if value else 0)
-        
-        level_path = os.path.join(world_dir, 'level.dat')
-        with open(level_path, 'wb') as f:
-            nbt.write(root_tag, f)
+        try:
+            import anvil.nbt as nbt
+            root_tag = nbt.Compound('Data')
+            for key, value in level_data['Data'].items():
+                if isinstance(value, str):
+                    root_tag[key] = nbt.String(key, value)
+                elif isinstance(value, int):
+                    root_tag[key] = nbt.Int(key, value)
+                elif isinstance(value, bool):
+                    root_tag[key] = nbt.Byte(key, 1 if value else 0)
+            
+            level_path = os.path.join(world_dir, 'level.dat')
+            with open(level_path, 'wb') as f:
+                nbt.write(root_tag, f)
+        except Exception as e:
+            logger.error(f"Error creating level.dat: {e}")
+            return jsonify({"success": False, "error": f"Level.dat creation failed: {str(e)}"}), 500
         
         # Zip the world
-        zip_buffer = BytesIO()
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            for root, dirs, files in os.walk(world_dir):
-                for file in files:
-                    file_path = os.path.join(root, file)
-                    arc_path = os.path.relpath(file_path, temp_dir)
-                    zip_file.write(file_path, arc_path)
+        try:
+            zip_buffer = BytesIO()
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+                for root, dirs, files in os.walk(world_dir):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        arc_path = os.path.relpath(file_path, temp_dir)
+                        zip_file.write(file_path, arc_path)
+            logger.info(f"World zip created: {len(zip_buffer.getvalue())} bytes")
+        except Exception as e:
+            logger.error(f"Error creating world zip: {e}")
+            return jsonify({"success": False, "error": f"World zip creation failed: {str(e)}"}), 500
         
         zip_buffer.seek(0)
         
         # Upload to B2
-        world_key = f"worlds/{city_id}/world.zip"
-        upload_to_b2(zip_buffer.getvalue(), world_key)
+        try:
+            world_key = f"worlds/{city_id}/world.zip"
+            upload_to_b2(zip_buffer.getvalue(), world_key)
+            logger.info(f"World uploaded successfully to {world_key}")
+        except Exception as e:
+            logger.error(f"Error uploading world: {e}")
+            return jsonify({"success": False, "error": f"World upload failed: {str(e)}"}), 500
         
         # Generate presigned URL
-        download_url = generate_presigned_url(world_key)
-        
-        # Cleanup
-        shutil.rmtree(temp_dir)
-        
-        return jsonify({
-            "success": True,
-            "download_url": download_url,
-            "city_id": city_id
-        })
-        
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        try:
+            download_url = generate_presigned_url(world_key)
+            if download_url:
+                return jsonify({
+                    "success": True,
+                    "download_url": download_url,
+                    "city_id": city_id
+                })
+            else:
+                return jsonify({"success": False, "error": "Failed to generate download URL"}), 500
+        except Exception as e:
+            logger.error(f"Error in generate_world: {e}")
+            return jsonify({"success": False, "error": f"World generation failed: {str(e)}"}), 500
 
 @app.route('/generate-render', methods=['POST'])
 def generate_render():
@@ -268,11 +316,14 @@ def generate_render():
         schematic_key = data['schematic_key']
         
         # Download schematic from B2
-        response = s3_client.get_object(Bucket=B2_BUCKET, Key=schematic_key)
-        schematic_data = response['Body'].read()
-        
-        # Load schematic (numpy array)
-        schematic = np.load(BytesIO(schematic_data))
+        try:
+            response = s3_client.get_object(Bucket=B2_BUCKET, Key=schematic_key)
+            schematic_data = response['Body'].read()
+            schematic = np.load(BytesIO(schematic_data))
+            logger.info(f"Schematic loaded: {schematic_key}")
+        except Exception as e:
+            logger.error(f"Error downloading schematic: {e}")
+            return jsonify({"success": False, "error": f"Schematic download failed: {str(e)}"}), 500
         
         # Generate isometric render
         render_image = generate_isometric_render(schematic)
@@ -297,119 +348,67 @@ def generate_render():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
-def generate_isometric_render(schematic):
-    """Generate isometric render from schematic data"""
-    # Schematic dimensions: (1040, 256, 1040) -> (x, y, z)
-    width, height, depth = schematic.shape
-    
-    # Create image
-    img_width, img_height = 800, 600
-    img = Image.new('RGB', (img_width, img_height), (10, 22, 40))  # Sea margin color
-    pixels = img.load()
-    
-    # Calculate offset to center the island
-    offset_x = img_width // 2
-    offset_y = img_height // 2
-    
-    # Render blocks (sorted by distance for proper layering)
-    blocks_to_render = []
-    
-    for x in range(width):
-        for y in range(height):
-            for z in range(depth):
-                block_id = schematic[x, y, z]
-                if block_id > 0:  # Non-air block
-                    iso_x, iso_y = world_to_iso(x, y, z)
-                    screen_x = int(offset_x + iso_x)
-                    screen_y = int(offset_y + iso_y)
-                    
-                    # Check if inside octagon for sea margin coloring
-                    center_x, center_z = 520, 520
-                    land_size = 400
-                    is_in_octagon = is_inside_octagon(x, z, center_x, center_z, land_size)
-                    
-                    blocks_to_render.append((x, y, z, block_id, screen_x, screen_y, is_in_octagon))
-    
-    # Sort by distance (render far blocks first)
-    blocks_to_render.sort(key=lambda b: b[0] + b[1] + b[2], reverse=True)
-    
-    # Draw blocks
-    for x, y, z, block_id, screen_x, screen_y, is_in_octagon in blocks_to_render:
-        if block_id in BLOCK_COLORS:
-            top_color, left_color, right_color = BLOCK_COLORS[block_id]
-            
-            # Apply sea margin tint if outside octagon
-            if not is_in_octagon:
-                sea_tint = (10, 22, 40)
-                top_color = tuple(int(c * 0.3 + sea_tint[i] * 0.7) for i, c in enumerate(top_color))
-                left_color = tuple(int(c * 0.3 + sea_tint[i] * 0.7) for i, c in enumerate(left_color))
-                right_color = tuple(int(c * 0.3 + sea_tint[i] * 0.7) for i, c in enumerate(right_color))
-            
-            # Draw simplified block faces (2x2 pixels per block face)
-            for dx in range(2):
-                for dy in range(2):
-                    px, py = screen_x + dx, screen_y + dy
-                    if 0 <= px < img_width and 0 <= py < img_height:
-                        # Use top color for simplicity
-                        pixels[px, py] = top_color
-    
-    return img
-
 @app.route('/process-world-upload', methods=['POST'])
 def process_world_upload():
     try:
-        city_id = request.form.get('city_id')
-        world_zip = request.files.get('world_zip')
+        if 'world_zip' not in request.files:
+            return jsonify({"success": False, "error": "Missing world_zip file"}), 400
         
-        if not world_zip or not city_id:
-            return jsonify({"success": False, "error": "Missing required fields"}), 400
+        world_zip = request.files['world_zip']
+        city_id = request.form.get('city_id')
+        
+        if not city_id:
+            return jsonify({"success": False, "error": "Missing city_id"}), 400
         
         # Create temporary directory
         temp_dir = tempfile.mkdtemp()
         
-        # Save and extract uploaded zip
-        zip_path = os.path.join(temp_dir, 'uploaded_world.zip')
-        world_dir = os.path.join(temp_dir, 'world')
-        world_zip.save(zip_path)
-        
-        with zipfile.ZipFile(zip_path, 'r') as zip_file:
-            zip_file.extractall(world_dir)
-        
-        # Extract 1040x1040 area centered at (520, 520)
-        schematic = extract_world_area(world_dir)
-        
-        # Save schematic as numpy array
-        schematic_buffer = BytesIO()
-        np.save(schematic_buffer, schematic)
-        schematic_buffer.seek(0)
-        
-        # Upload schematic to B2
-        schematic_key = f"schematics/{city_id}/schematic.npy"
-        upload_to_b2(schematic_buffer.getvalue(), schematic_key)
-        
-        # Generate render
-        render_data = {
-            "city_id": city_id,
-            "schematic_key": schematic_key
-        }
-        
-        # Internal call to generate-render
-        with app.test_request_context('/generate-render', json=render_data, method='POST'):
-            render_response = generate_render()
-            render_result = render_response.get_json()
-        
-        # Cleanup
-        shutil.rmtree(temp_dir)
-        
-        return jsonify({
-            "success": True,
-            "schematic_key": schematic_key,
-            "render_url": render_result.get("render_url"),
-            "city_id": city_id
-        })
-        
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+        try:
+            # Save and extract uploaded zip
+            zip_path = os.path.join(temp_dir, 'uploaded_world.zip')
+            world_zip.save(zip_path)
+            
+            world_dir = os.path.join(temp_dir, 'world')
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(world_dir)
+            
+            # Extract 1040x1040 block area centered at (520, 520)
+            schematic = extract_world_area(world_dir)
+            
+            # Save schematic as numpy array
+            schematic_buffer = BytesIO()
+            np.save(schematic_buffer, schematic)
+            schematic_buffer.seek(0)
+            
+            # Upload schematic to B2
+            schematic_key = f"schematics/{city_id}/schematic.npy"
+            upload_to_b2(schematic_buffer.getvalue(), schematic_key)
+            logger.info(f"Schematic uploaded to {schematic_key}")
+            
+            # Internal call to generate-render endpoint
+            render_data = {
+                'city_id': city_id,
+                'schematic_key': schematic_key
+            }
+            
+            with app.test_request_context('/generate-render', json=render_data, method='POST') as ctx:
+                render_response = generate_render()
+                render_result = render_response.get_json()
+            
+            # Cleanup
+            shutil.rmtree(temp_dir)
+            
+            return jsonify({
+                "success": True,
+                "schematic_key": schematic_key,
+                "render_url": render_result.get('render_url'),
+                "city_id": city_id
+            })
+        except Exception as e:
+            logger.error(f"Error processing world upload: {e}")
+            if os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+            return jsonify({"success": False, "error": f"World upload failed: {str(e)}"}), 500
 
 def extract_world_area(world_dir):
     """Extract 1040x1040 block area from world"""
