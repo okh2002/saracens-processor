@@ -1,0 +1,6 @@
+flask
+anvil-parser
+Pillow
+numpy
+boto3
+flask-cors
