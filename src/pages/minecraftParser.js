@@ -406,19 +406,19 @@ export function extractTopBlocksFromSchematic(schematic, sampleSize = 64) {
  * Parse any Minecraft world file (.mca, .schematic, or .zip containing region files).
  * Returns { topBlocks, width, height }
  */
-export async function parseMinecraftWorld(file) {
+export async function parseMinecraftWorld(file, sampleSize = 64) {
   const buffer = await file.arrayBuffer()
   const name = file.name.toLowerCase()
 
   if (name.endsWith(".schematic") || name.endsWith(".schem")) {
     const schematic = await parseSchematic(buffer)
-    return extractTopBlocksFromSchematic(schematic)
+    return extractTopBlocksFromSchematic(schematic, sampleSize)
   }
 
   if (name.endsWith(".mca")) {
     const chunks = await parseMCA(buffer)
     if (!chunks.length) throw new Error("No valid chunks found in region file")
-    return extractTopBlocksFromMCA(chunks)
+    return extractTopBlocksFromMCA(chunks, sampleSize)
   }
 
   if (name.endsWith(".zip")) {
@@ -439,19 +439,28 @@ export async function parseMinecraftWorld(file) {
       const allChunks = []
       for (const entry of mcaEntries) {
         try {
+          // Extract region coordinates from filename (r.X.Z.mca)
+          const match = entry.name.match(/r\.(-?\d+)\.(-?\d+)\.mca$/)
+          const regionX = match ? parseInt(match[1]) : 0
+          const regionZ = match ? parseInt(match[2]) : 0
           const chunks = await parseMCA(entry.data)
+          // Offset chunk coordinates by region position
+          for (const chunk of chunks) {
+            chunk.cx += regionX * 32
+            chunk.cz += regionZ * 32
+          }
           allChunks.push(...chunks)
         } catch {
           // skip corrupt region files
         }
       }
       if (!allChunks.length) throw new Error("No valid chunks found in world save")
-      return extractTopBlocksFromMCA(allChunks)
+      return extractTopBlocksFromMCA(allChunks, sampleSize)
     }
 
     if (schemEntries.length > 0) {
       const schematic = await parseSchematic(schemEntries[0].data)
-      return extractTopBlocksFromSchematic(schematic)
+      return extractTopBlocksFromSchematic(schematic, sampleSize)
     }
 
     throw new Error("No region (.mca) or schematic files found in zip")

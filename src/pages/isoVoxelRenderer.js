@@ -75,7 +75,12 @@ function isInsideOctagon(px, py, halfW, halfH) {
 export function renderWorldIsometric(topBlocks, gridSize, octWidth, octHeight) {
   const container = new PIXI.Container()
 
-  const tw = Math.max(1, Math.floor((octWidth * 1.6) / gridSize))
+  // Render at larger internal scale for better quality, then scale down
+  const renderScale = 4
+  const internalW = octWidth * renderScale
+  const internalH = octHeight * renderScale
+
+  const tw = Math.max(1, Math.floor((internalW * 1.6) / gridSize))
   const th = Math.max(1, Math.floor(tw * 0.5))
   const blockH = Math.max(1, th)
 
@@ -99,14 +104,10 @@ export function renderWorldIsometric(topBlocks, gridSize, octWidth, octHeight) {
       const px = sx - centerOff.sx
       const py = sy - centerOff.sy
 
-      if (!isInsideOctagon(px, py, octWidth * 0.88, octHeight * 0.88)) continue
+      if (!isInsideOctagon(px, py, internalW * 0.92, internalH * 0.92)) continue
 
-      if (bid === 0) {
-        gfx.beginFill(0x0A1628, 0.6)
-        gfx.drawPolygon([px, py - th, px + tw, py, px, py + th, px - tw, py])
-        gfx.endFill()
-        continue
-      }
+      // Skip air blocks — let the island background show through
+      if (bid === 0) continue
 
       const colors = getBlockColors(bid)
 
@@ -125,6 +126,8 @@ export function renderWorldIsometric(topBlocks, gridSize, octWidth, octHeight) {
   }
 
   container.addChild(gfx)
+  // Scale down to fit the island octagon
+  container.scale.set(1 / renderScale)
   return container
 }
 

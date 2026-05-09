@@ -82,7 +82,7 @@ export default function MatrixPageIso() {
     try {
       setParseError(null)
       setParseLoading(true)
-      const result = await parseMinecraftWorld(file)
+      const result = await parseMinecraftWorld(file, 48)
       setWorldDataMap((prev) => ({ ...prev, [cityId]: result }))
       setSelectedCity(null)
     } catch (err) {
