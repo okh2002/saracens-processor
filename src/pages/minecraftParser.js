@@ -422,23 +422,137 @@ export async function parseMinecraftWorld(file) {
   }
 
   if (name.endsWith(".zip")) {
-    const { entries } = await readZip(buffer)
-    const mcaEntries = entries.filter(e => e.name.endsWith(".mca"))
-    if (!mcaEntries.length) throw new Error("No .mca region files found in zip")
+    const entries = await readZipEntries(buffer)
 
-    const allChunks = []
-    for (const entry of mcaEntries) {
-      const chunks = await parseMCA(entry.data)
-      allChunks.push(...chunks)
+    // Look for .mca region files in any subdirectory (e.g., worldname/region/r.0.0.mca)
+    const mcaEntries = entries.filter(e =>
+      e.name.endsWith(".mca") && !e.name.startsWith("__MACOSX")
+    )
+
+    // Also look for .schematic files inside the zip
+    const schemEntries = entries.filter(e =>
+      (e.name.endsWith(".schematic") || e.name.endsWith(".schem")) &&
+      !e.name.startsWith("__MACOSX")
+    )
+
+    if (mcaEntries.length > 0) {
+      const allChunks = []
+      for (const entry of mcaEntries) {
+        try {
+          const chunks = await parseMCA(entry.data)
+          allChunks.push(...chunks)
+        } catch {
+          // skip corrupt region files
+        }
+      }
+      if (!allChunks.length) throw new Error("No valid chunks found in world save")
+      return extractTopBlocksFromMCA(allChunks)
     }
-    if (!allChunks.length) throw new Error("No valid chunks found in world")
-    return extractTopBlocksFromMCA(allChunks)
+
+    if (schemEntries.length > 0) {
+      const schematic = await parseSchematic(schemEntries[0].data)
+      return extractTopBlocksFromSchematic(schematic)
+    }
+
+    throw new Error("No region (.mca) or schematic files found in zip")
   }
 
   throw new Error("Unsupported file type. Use .mca, .schematic, or .zip")
 }
 
-async function readZip(buffer) {
+async function decompressRawDeflate(buffer) {
+  const ds = new DecompressionStream("deflate-raw")
+  const writer = ds.writable.getWriter()
+  writer.write(new Uint8Array(buffer))
+  writer.close()
+  const reader = ds.readable.getReader()
+  const chunks = []
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    chunks.push(value)
+  }
+  const total = chunks.reduce((s, c) => s + c.length, 0)
+  const result = new Uint8Array(total)
+  let off = 0
+  for (const c of chunks) { result.set(c, off); off += c.length }
+  return result.buffer
+}
+
+/**
+ * Read zip file entries using the Central Directory (reliable approach).
+ * Handles data descriptors, various compression methods, and nested paths.
+ */
+async function readZipEntries(buffer) {
+  const view = new DataView(buffer)
+  const bytes = new Uint8Array(buffer)
+  const entries = []
+
+  // Find End of Central Directory (EOCD) - scan from end
+  let eocdOffset = -1
+  for (let i = bytes.length - 22; i >= Math.max(0, bytes.length - 65557); i--) {
+    if (view.getUint32(i, true) === 0x06054b50) {
+      eocdOffset = i
+      break
+    }
+  }
+
+  if (eocdOffset === -1) {
+    // Fallback: try reading local file headers directly
+    return readZipLocal(buffer)
+  }
+
+  const cdOffset = view.getUint32(eocdOffset + 16, true)
+  const cdEntries = view.getUint16(eocdOffset + 10, true)
+
+  let offset = cdOffset
+  for (let i = 0; i < cdEntries && offset < eocdOffset; i++) {
+    if (view.getUint32(offset, true) !== 0x02014b50) break
+
+    const compressionMethod = view.getUint16(offset + 10, true)
+    const compressedSize = view.getUint32(offset + 20, true)
+    const nameLen = view.getUint16(offset + 28, true)
+    const extraLen = view.getUint16(offset + 30, true)
+    const commentLen = view.getUint16(offset + 32, true)
+    const localHeaderOffset = view.getUint32(offset + 42, true)
+
+    const nameBytes = new Uint8Array(buffer, offset + 46, nameLen)
+    const name = new TextDecoder().decode(nameBytes)
+
+    offset += 46 + nameLen + extraLen + commentLen
+
+    // Skip directories
+    if (name.endsWith("/") || compressedSize === 0) continue
+
+    // Read data from local file header
+    const localNameLen = view.getUint16(localHeaderOffset + 26, true)
+    const localExtraLen = view.getUint16(localHeaderOffset + 28, true)
+    const dataStart = localHeaderOffset + 30 + localNameLen + localExtraLen
+    const rawData = buffer.slice(dataStart, dataStart + compressedSize)
+
+    let data
+    if (compressionMethod === 0) {
+      data = rawData
+    } else if (compressionMethod === 8) {
+      try {
+        data = await decompressRawDeflate(rawData)
+      } catch {
+        data = rawData
+      }
+    } else {
+      data = rawData
+    }
+
+    entries.push({ name, data })
+  }
+
+  return entries
+}
+
+/**
+ * Fallback zip reader using local file headers only.
+ */
+async function readZipLocal(buffer) {
   const view = new DataView(buffer)
   const entries = []
   let offset = 0
@@ -447,9 +561,9 @@ async function readZip(buffer) {
     const sig = view.getUint32(offset, true)
     if (sig !== 0x04034b50) break
 
+    const flags = view.getUint16(offset + 6, true)
     const compressionMethod = view.getUint16(offset + 8, true)
-    const compressedSize = view.getUint32(offset + 18, true)
-    view.getUint32(offset + 22, true) // uncompressedSize - read to advance parsing
+    let compressedSize = view.getUint32(offset + 18, true)
     const nameLen = view.getUint16(offset + 26, true)
     const extraLen = view.getUint16(offset + 28, true)
 
@@ -457,14 +571,37 @@ async function readZip(buffer) {
     const name = new TextDecoder().decode(nameBytes)
 
     const dataStart = offset + 30 + nameLen + extraLen
+
+    // Handle data descriptor (bit 3 of flags) — sizes are after compressed data
+    if ((flags & 0x08) && compressedSize === 0) {
+      // Scan for next local file header or central directory signature
+      let scanPos = dataStart
+      while (scanPos < buffer.byteLength - 4) {
+        const nextSig = view.getUint32(scanPos, true)
+        if (nextSig === 0x04034b50 || nextSig === 0x02014b50) break
+        // Check for data descriptor signature (optional)
+        if (nextSig === 0x08074b50) {
+          compressedSize = scanPos - dataStart
+          break
+        }
+        scanPos++
+      }
+      if (compressedSize === 0) compressedSize = scanPos - dataStart
+    }
+
     const rawData = buffer.slice(dataStart, dataStart + compressedSize)
 
     let data
-    if (compressionMethod === 0) {
+    if (name.endsWith("/") || compressedSize === 0) {
+      offset = dataStart + compressedSize
+      // Skip data descriptor if present
+      if (flags & 0x08) offset += (view.getUint32(offset, true) === 0x08074b50 ? 16 : 12)
+      continue
+    } else if (compressionMethod === 0) {
       data = rawData
     } else if (compressionMethod === 8) {
       try {
-        data = await decompressZlib(rawData)
+        data = await decompressRawDeflate(rawData)
       } catch {
         data = rawData
       }
@@ -474,7 +611,15 @@ async function readZip(buffer) {
 
     entries.push({ name, data })
     offset = dataStart + compressedSize
+    // Skip data descriptor if present
+    if (flags & 0x08) {
+      if (offset < buffer.byteLength - 4 && view.getUint32(offset, true) === 0x08074b50) {
+        offset += 16
+      } else {
+        offset += 12
+      }
+    }
   }
 
-  return { entries }
+  return entries
 }
