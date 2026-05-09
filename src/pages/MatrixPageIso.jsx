@@ -57,6 +57,8 @@ export default function MatrixPageIso() {
   const [worldDataMap, setWorldDataMap] = useState({})
   const [uploadingCity, setUploadingCity] = useState(null)
   const [parseError, setParseError] = useState(null)
+  const [selectedCity, setSelectedCity] = useState(null)
+  const [parseLoading, setParseLoading] = useState(false)
   const isMounted = useRef(true)
   const appRef = useRef(null)
   const islandContainersRef = useRef({})
@@ -79,13 +81,16 @@ export default function MatrixPageIso() {
   const handleWorldUpload = useCallback(async (file, cityId) => {
     try {
       setParseError(null)
+      setParseLoading(true)
       const result = await parseMinecraftWorld(file)
       setWorldDataMap((prev) => ({ ...prev, [cityId]: result }))
+      setSelectedCity(null)
     } catch (err) {
       setParseError(`خطأ في قراءة الملف: ${err.message}`)
       setTimeout(() => setParseError(null), 5000)
     } finally {
       setUploadingCity(null)
+      setParseLoading(false)
     }
   }, [])
 
@@ -270,17 +275,14 @@ export default function MatrixPageIso() {
         setTooltip(null)
       })
       island.on("pointerdown", (e) => {
-        if (city) navigate(`/city/${encodeURIComponent(city.name)}`)
-        else setApplyPrompt({ x: e.global.x, y: e.global.y })
+        if (city) {
+          setSelectedCity({ id: city.id, name: city.name, x: e.global.x, y: e.global.y })
+          setApplyPrompt(null)
+        } else {
+          setApplyPrompt({ x: e.global.x, y: e.global.y })
+          setSelectedCity(null)
+        }
       })
-
-      if (city) {
-        island.on("rightclick", (e) => {
-          e.data?.originalEvent?.preventDefault?.()
-          setUploadingCity(city.id)
-          setTimeout(() => fileInputRef.current?.click(), 50)
-        })
-      }
 
       worldContainer.addChild(island)
       tileRefs.push({ city, foam, top })
@@ -477,16 +479,87 @@ export default function MatrixPageIso() {
         </div>
       </div>
 
-      {/* Upload hint */}
-      <div
-        style={{
-          position: "absolute", bottom: 16, left: "50%", transform: "translateX(-50%)",
-          zIndex: 20, fontFamily: "Amiri, Georgia, serif", fontSize: "11px",
-          color: "rgba(212,180,131,0.45)", pointerEvents: "none", whiteSpace: "nowrap",
-        }}
-      >
-        انقر بزر الماوس الأيمن على مدينة لتحميل عالم ماينكرافت
-      </div>
+      {/* City upload panel */}
+      {selectedCity && (
+        <div
+          style={{
+            position: "absolute",
+            left: Math.min(Math.max(selectedCity.x, 160), window.innerWidth - 160),
+            top: Math.max(selectedCity.y - 20, 70),
+            transform: "translate(-50%, -100%)",
+            background: "rgba(10,22,40,0.97)",
+            border: "1px solid rgba(201,168,76,0.55)",
+            borderRadius: "6px",
+            padding: "14px 18px",
+            zIndex: 50,
+            fontFamily: "Amiri, Georgia, serif",
+            color: "#D4B483",
+            textAlign: "center",
+            direction: "rtl",
+            minWidth: "220px",
+          }}
+        >
+          <div style={{ fontSize: "14px", fontWeight: 600, marginBottom: "10px", color: "#C9A84C" }}>
+            {selectedCity.name}
+          </div>
+          <div style={{ display: "flex", gap: "8px", justifyContent: "center", flexWrap: "wrap", marginBottom: "10px" }}>
+            <button
+              onClick={() => navigate(`/city/${encodeURIComponent(selectedCity.name)}`)}
+              style={{
+                border: "1px solid rgba(201,168,76,0.5)",
+                background: "rgba(201,168,76,0.12)",
+                color: "#D4B483",
+                padding: "5px 12px",
+                cursor: "pointer",
+                fontFamily: "Amiri, Georgia, serif",
+                fontSize: "12px",
+                borderRadius: "4px",
+              }}
+            >
+              دخول المدينة
+            </button>
+            <button
+              onClick={() => {
+                setUploadingCity(selectedCity.id)
+                setTimeout(() => fileInputRef.current?.click(), 50)
+              }}
+              disabled={parseLoading}
+              style={{
+                border: "1px solid #C9A84C",
+                background: "#C9A84C",
+                color: "#0A1628",
+                padding: "5px 12px",
+                cursor: parseLoading ? "wait" : "pointer",
+                fontFamily: "Amiri, Georgia, serif",
+                fontSize: "12px",
+                borderRadius: "4px",
+                fontWeight: 600,
+                opacity: parseLoading ? 0.6 : 1,
+              }}
+            >
+              {parseLoading ? "جاري التحميل..." : "تحميل عالم"}
+            </button>
+          </div>
+          <div style={{ fontSize: "10px", color: "rgba(212,180,131,0.5)" }}>
+            .mca .schematic .zip
+          </div>
+          {worldDataMap[selectedCity.id] && (
+            <div style={{ fontSize: "10px", color: "rgba(100,200,100,0.7)", marginTop: "4px" }}>
+              تم تحميل العالم بنجاح
+            </div>
+          )}
+          <button
+            onClick={() => setSelectedCity(null)}
+            style={{
+              position: "absolute", top: "4px", left: "8px",
+              background: "none", border: "none", color: "rgba(212,180,131,0.5)",
+              cursor: "pointer", fontSize: "14px", padding: "2px",
+            }}
+          >
+            x
+          </button>
+        </div>
+      )}
 
       {tooltip && (
         <div
