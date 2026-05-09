@@ -882,7 +882,11 @@ def generate_tile_render():
             elif file_path.endswith(".zip"):
                 extract_dir = os.path.join(tmp_dir, "world")
                 with zipfile.ZipFile(file_path, "r") as zf:
-                    zf.extractall(extract_dir)
+                    for member in zf.namelist():
+                        member_path = os.path.realpath(os.path.join(extract_dir, member))
+                        if not member_path.startswith(os.path.realpath(extract_dir) + os.sep):
+                            continue
+                        zf.extract(member, extract_dir)
 
                 region_dir = None
                 for root, dirs, files in os.walk(extract_dir):
