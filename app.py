@@ -761,6 +761,212 @@ def render_from_top_blocks(blocks_top: np.ndarray, output_size=(800, 600)) -> Im
     return img
 
 
+def render_octagonal_tile(blocks_top: np.ndarray, tile_size=256) -> Image.Image:
+    """
+    Render an octagonal isometric tile optimized for the matrix island view.
+    Returns a transparent-background PNG clipped to an octagonal boundary.
+    blocks_top: [z, x] array of block IDs
+    """
+    W = H = tile_size
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    size_z, size_x = blocks_top.shape
+    tw = max(1, tile_size // (size_x + size_z))
+    th = max(1, tw // 2)
+
+    cx = W // 2
+    cy = H // 2
+
+    offset_y = -(size_x + size_z) * th // 2
+
+    # Draw octagonal clipping mask
+    oct_points = []
+    oct_radius = tile_size // 2 - 4
+    for i in range(8):
+        angle = (i / 8) * math.pi * 2 - math.pi / 2
+        oct_points.append((
+            cx + int(oct_radius * math.cos(angle)),
+            cy + int(oct_radius * 0.45 * math.sin(angle))
+        ))
+
+    mask = Image.new("L", (W, H), 0)
+    mask_draw = ImageDraw.Draw(mask)
+    mask_draw.polygon(oct_points, fill=255)
+
+    for diagonal in range(size_x + size_z - 1):
+        for x in range(max(0, diagonal - size_z + 1), min(diagonal + 1, size_x)):
+            z = diagonal - x
+            if z < 0 or z >= size_z:
+                continue
+
+            bid = int(blocks_top[z, x])
+
+            sx = (x - z) * tw + cx
+            sy = (x + z) * th + cy + offset_y
+
+            colors = BLOCK_COLORS.get(bid)
+            if colors is None:
+                colors = BLOCK_COLORS.get(1, ((125, 125, 125), (100, 100, 100), (112, 112, 112)))
+
+            top_c, left_c, right_c = colors
+
+            top_pts = [(sx, sy - th), (sx + tw, sy), (sx, sy + th), (sx - tw, sy)]
+            draw.polygon(top_pts, fill=top_c + (255,))
+
+            left_pts = [(sx - tw, sy), (sx, sy + th), (sx, sy + th + th), (sx - tw, sy + th)]
+            draw.polygon(left_pts, fill=left_c + (255,))
+
+            right_pts = [(sx + tw, sy), (sx, sy + th), (sx, sy + th + th), (sx + tw, sy + th)]
+            draw.polygon(right_pts, fill=right_c + (255,))
+
+    img.putalpha(mask)
+    return img
+
+
+@app.route("/generate-tile-render", methods=["POST"])
+def generate_tile_render():
+    """Generate an octagonal isometric tile render from an uploaded world."""
+    try:
+        city_id = request.form.get("city_id", "unknown")
+        world_file = request.files.get("world_file")
+        tile_size = int(request.form.get("tile_size", 256))
+
+        if not world_file:
+            return jsonify({"success": False, "error": "No world file provided"}), 400
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            file_path = os.path.join(tmp_dir, world_file.filename)
+            world_file.save(file_path)
+
+            blocks_top = None
+
+            if file_path.endswith(".mca"):
+                try:
+                    import anvil
+                    region = anvil.Region.from_file(file_path)
+                    SAMPLE = 64
+                    blocks_top = np.zeros((SAMPLE, SAMPLE), dtype=np.uint8)
+                    for chunk_x in range(32):
+                        for chunk_z in range(32):
+                            try:
+                                chunk = region.get_chunk(chunk_x, chunk_z)
+                            except Exception:
+                                continue
+                            for lx in range(16):
+                                for lz in range(16):
+                                    wx = chunk_x * 16 + lx
+                                    wz = chunk_z * 16 + lz
+                                    sx = int((wx / 512) * SAMPLE)
+                                    sz = int((wz / 512) * SAMPLE)
+                                    if sx >= SAMPLE or sz >= SAMPLE:
+                                        continue
+                                    for y in range(255, -1, -1):
+                                        try:
+                                            block = chunk.get_block(lx, y, lz)
+                                            if block and block.id not in ("minecraft:air", "air", ""):
+                                                name = block.id.replace("minecraft:", "")
+                                                bid = {
+                                                    "grass_block": 2, "stone": 1, "dirt": 3,
+                                                    "sand": 12, "water": 9, "snow": 80,
+                                                    "gravel": 13, "bedrock": 7,
+                                                }.get(name, 1)
+                                                blocks_top[sz, sx] = bid
+                                                break
+                                        except Exception:
+                                            break
+                except Exception as e:
+                    return jsonify({"success": False, "error": f"Error reading .mca: {e}"}), 400
+
+            elif file_path.endswith(".zip"):
+                extract_dir = os.path.join(tmp_dir, "world")
+                with zipfile.ZipFile(file_path, "r") as zf:
+                    for member in zf.namelist():
+                        member_path = os.path.realpath(os.path.join(extract_dir, member))
+                        if not member_path.startswith(os.path.realpath(extract_dir) + os.sep):
+                            continue
+                        zf.extract(member, extract_dir)
+
+                region_dir = None
+                for root, dirs, files in os.walk(extract_dir):
+                    if "region" in dirs:
+                        region_dir = os.path.join(root, "region")
+                        break
+
+                if not region_dir:
+                    return jsonify({"success": False, "error": "No region directory found"}), 400
+
+                SAMPLE = 64
+                blocks_top = np.zeros((SAMPLE, SAMPLE), dtype=np.uint8)
+                import re
+                for mca_file in os.listdir(region_dir):
+                    if not mca_file.endswith(".mca"):
+                        continue
+                    mca_path = os.path.join(region_dir, mca_file)
+                    try:
+                        import anvil
+                        region = anvil.Region.from_file(mca_path)
+                        match = re.match(r"r\.(-?\d+)\.(-?\d+)\.mca", mca_file)
+                        rx, rz = (int(match.group(1)), int(match.group(2))) if match else (0, 0)
+                        for cx in range(32):
+                            for cz in range(32):
+                                try:
+                                    chunk = region.get_chunk(cx, cz)
+                                except Exception:
+                                    continue
+                                for lx in range(16):
+                                    for lz in range(16):
+                                        wx = (rx * 32 + cx) * 16 + lx
+                                        wz = (rz * 32 + cz) * 16 + lz
+                                        sx = wx % SAMPLE
+                                        sz = wz % SAMPLE
+                                        for y in range(255, -1, -1):
+                                            try:
+                                                block = chunk.get_block(lx, y, lz)
+                                                if block and block.id not in ("minecraft:air", "air", ""):
+                                                    name = block.id.replace("minecraft:", "")
+                                                    bid = {
+                                                        "grass_block": 2, "stone": 1, "dirt": 3,
+                                                        "sand": 12, "water": 9, "snow": 80,
+                                                        "gravel": 13, "bedrock": 7,
+                                                    }.get(name, 1)
+                                                    blocks_top[sz, sx] = bid
+                                                    break
+                                            except Exception:
+                                                break
+                    except Exception:
+                        continue
+            else:
+                return jsonify({"success": False, "error": "Unsupported format. Use .mca or .zip"}), 400
+
+            if blocks_top is None or not blocks_top.any():
+                return jsonify({"success": False, "error": "No blocks found in world"}), 400
+
+            tile_img = render_octagonal_tile(blocks_top, tile_size)
+            render_path = os.path.join(tmp_dir, "tile.png")
+            tile_img.save(render_path, "PNG")
+
+            tile_key = f"tiles/{city_id}/tile.png"
+            upload_to_b2(render_path, tile_key)
+            tile_url = get_presigned_url(tile_key, expiry=86400 * 30)
+
+            return jsonify({
+                "success": True,
+                "tile_url": tile_url,
+                "city_id": city_id,
+                "message": "تم توليد البلاطة بنجاح"
+            })
+
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    except Exception as e:
+        print(f"Error generating tile: {e}")
+        import traceback; traceback.print_exc()
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
