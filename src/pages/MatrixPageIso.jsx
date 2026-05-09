@@ -25,11 +25,13 @@ function isoProject(x, y, h = 0) {
   return { x: (x - y) * 0.88, y: (x + y) * 0.46 - h }
 }
 
+const OCT_ANGLE_OFFSET = Math.PI / 8
+
 function getOctagonPoints(width, height) {
   const points = []
   const steps = 8
   for (let i = 0; i < steps; i++) {
-    const angle = (i / steps) * Math.PI * 2 - Math.PI / 2
+    const angle = (i / steps) * Math.PI * 2 - Math.PI / 2 + OCT_ANGLE_OFFSET
     points.push(Math.cos(angle) * width, Math.sin(angle) * height)
   }
   return points
@@ -43,10 +45,10 @@ const CITIES = [
   { id: 4, name: "مدينة الريح", color: 0x2A1A2A, isAsateen: true, tier: "الأساة" },
 ]
 
-const TILE_SIZE = 72
-const GAP = 36
-const OCT_W = 62
-const OCT_H = 28
+const TILE_SIZE = 160
+const GAP = 60
+const OCT_W = 140
+const OCT_H = 64
 
 export default function MatrixPageIso() {
   const canvasRef = useRef(null)
@@ -82,7 +84,7 @@ export default function MatrixPageIso() {
     try {
       setParseError(null)
       setParseLoading(true)
-      const result = await parseMinecraftWorld(file, 48)
+      const result = await parseMinecraftWorld(file, 96)
       setWorldDataMap((prev) => ({ ...prev, [cityId]: result }))
       setSelectedCity(null)
     } catch (err) {
@@ -260,7 +262,7 @@ export default function MatrixPageIso() {
           fill: city.isLeader ? 0xC9A84C : 0xD4B483,
         })
         label.anchor.set(0.5)
-        label.y = OCT_H + 12
+        label.y = OCT_H + 16
         island.addChild(label)
       }
 
@@ -408,10 +410,10 @@ export default function MatrixPageIso() {
         data.width,
         OCT_W,
         OCT_H,
-        CITIES.find((c) => c.id === cityId)?.color || 0x1A3A2A
+        data.topHeights
       )
 
-      const mask = createOctagonMask(OCT_W * 0.92, OCT_H * 0.92)
+      const mask = createOctagonMask(OCT_W * 0.97, OCT_H * 1.25)
       worldLayer.addChild(mask)
       voxelContainer.mask = mask
 
